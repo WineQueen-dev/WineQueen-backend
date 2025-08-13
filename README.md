@@ -1,5 +1,4 @@
-프론트엔드 배포 링크: https://wine-queen-74pol4zkk-junseochois-projects.vercel.app/main
-cd WineQueen/backend
+cd WineQueen/backend-repo
 uvicorn main:app --host 0.0.0.0 --port 8000
 
 cd WineQueen
