@@ -10,7 +10,6 @@ import json
 import time
 import os
 import asyncio
-from queue import Queue
 
 import serial # 시리얼 통신 라이브러리 
 
@@ -95,7 +94,7 @@ def detection_loop():
             # 밀봉 또는 개봉 작업이 진행 중일 때, 시간이 다 되었는지 확인
             if current_state in [SEALING, OPENING] and PROCESS_START_TIME is not None:
                 if time.time() - PROCESS_START_TIME > PROCESS_DURATION:
-                    print(f"✅ 작업 시간({PROCESS_DURATION}초) 경과. 시스템 상태를 '{STAY}'로 복귀합니다.")
+                    print(f"작업 시간({PROCESS_DURATION}초) 경과. 시스템 상태를 '{STAY}'로 복귀합니다.")
                     SYSTEM_STATE = STAY
                     TARGET_ACTION = None
                     PROCESS_START_TIME = None
@@ -337,65 +336,8 @@ else:
     @app.get("/")
     def root():
         return {"message": "Backend is running, but frontend build is not found."}
-    
-# --- [추가] 버튼 이벤트 공유용 ---
-last_button = None               # 최근 눌린 버튼 (1/2/3)
-button_queue = Queue()           # 실시간 이벤트 전달용 (스레드→async)
-ser_lock = threading.Lock()      # 시리얼 write/read 동시 접근 보호
-
-# --- [추가] 시리얼 수신 전용 스레드 ---
-def serial_reader_loop():
-    global ser, last_button
-    while True:
-        # 포트가 안 열렸으면 재시도
-        if ser is None or not ser.is_open:
-            try:
-                ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
-                print(f"✅ 시리얼 포트 재연결: {SERIAL_PORT}")
-                time.sleep(2)  # 아두이노 리셋 대기
-            except Exception as e:
-                print(f"❌ 시리얼 연결 실패(재시도): {e}")
-                time.sleep(2)
-                continue
-
-        try:
-            with ser_lock:
-                raw = ser.readline()
-            if not raw:
-                continue
-
-            line = raw.decode(errors="ignore").strip()
-            # 버튼 1/2/3만 유효로 처리
-            if line in ("1", "2", "3"):
-                last_button = int(line)
-                # 실시간 브로드캐스트를 위해 큐에 넣기
-                button_queue.put_nowait(last_button)
-                # print(f"[BTN] {last_button}")
-        except Exception as e:
-            print(f"시리얼 읽기 오류: {e}")
-            try:
-                ser.close()
-            except:
-                pass
-            ser = None
-            time.sleep(1)
-
-# --- [추가] 버튼 이벤트 브로드캐스트 (큐를 async에서 소비) ---
-async def broadcast_buttons():
-    loop = asyncio.get_running_loop()
-    while True:
-        # blocking Queue.get()를 안전하게 실행
-        btn = await loop.run_in_executor(None, button_queue.get)
-        payload = json.dumps({"type": "button", "value": btn, "ts": time.time()})
-        try:
-            await asyncio.gather(
-                *[ws.send_text(payload) for ws in clients],
-                return_exceptions=False
-            )
-        except Exception as e:
-            print(f"버튼 브로드캐스트 오류: {e}")
-
 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
