@@ -94,7 +94,7 @@ def detection_loop():
             # 밀봉 또는 개봉 작업이 진행 중일 때, 시간이 다 되었는지 확인
             if current_state in [SEALING, OPENING] and PROCESS_START_TIME is not None:
                 if time.time() - PROCESS_START_TIME > PROCESS_DURATION:
-                    print(f"작업 시간({PROCESS_DURATION}초) 경과. 시스템 상태를 '{STAY}'로 복귀합니다.")
+                    print(f"✅ 작업 시간({PROCESS_DURATION}초) 경과. 시스템 상태를 '{STAY}'로 복귀합니다.")
                     SYSTEM_STATE = STAY
                     TARGET_ACTION = None
                     PROCESS_START_TIME = None
