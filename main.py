@@ -1,6 +1,6 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, FileResponse
+from fastapi.responses import StreamingResponse, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from contextlib import asynccontextmanager
 from ultralytics import YOLO
@@ -16,7 +16,13 @@ import serial # 시리얼 통신 라이브러리
 
 # --- 전역 변수 및 설정 ---
 # YOLO 모델 로드 (학습된 커스텀 모델)
-model = YOLO("best_wCrop.pt") 
+model = YOLO("best_wCrop.pt")   
+PROCESS_START_TIME: float | None = None
+PROCESS_DURATION: float = 4.0  # 작업 소요(초) — 필요에 따라 조정
+# --- [추가] 버튼 이벤트 공유용 ---
+last_button = None               # 최근 눌린 버튼 (1/2/3)
+button_queue = Queue()           # 실시간 이벤트 전달용 (스레드→async)    # 시리얼 write/read 동시 접근 보호
+
 
 # 카메라 설정
 try:
@@ -198,19 +204,21 @@ def detection_loop():
 # --- 웹소켓 데이터 브로드캐스팅 (소비자) ---
 async def broadcast_detections():
     while True:
-        try:
-            with detections_lock:
-                detections_to_send = latest_detections_json
-            
-            # 비동기적으로 모든 클라이언트에게 메시지 전송
-            await asyncio.gather(
-                *[ws.send_text(detections_to_send) for ws in clients],
-                return_exceptions=False
-            )
-        except Exception as e:
-            print(f"브로드캐스팅 오류: {e}")
+        data = None
+        with detections_lock:
+            data = latest_detections_json
 
-        await asyncio.sleep(0.1) # 0.1초마다 데이터 전송
+        dead = []
+        for ws in list(clients):   # 스냅샷 반복
+            try:
+                await ws.send_text(data)
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            try: clients.remove(ws)
+            except: pass
+
+        await asyncio.sleep(0.1)
 
 # --- FastAPI Lifespan 및 라우트 설정 ---
 @asynccontextmanager
@@ -219,14 +227,22 @@ async def lifespan(app: FastAPI):
     detection_thread = threading.Thread(target=detection_loop, daemon=True)
     detection_thread.start()
     
+    # 버튼 수신 스레드 시작
+    serial_thread = threading.Thread(target=serial_reader_loop, daemon=True)
+    serial_thread.start()
+
+    # WS 브로드캐스트 태스크 시작
     broadcast_task = asyncio.create_task(broadcast_detections())
-    
-    yield
-    
-    print("서버 종료...")
-    broadcast_task.cancel()
-    if cap and cap.isOpened():
-        cap.release()
+    broadcast_btn_task = asyncio.create_task(broadcast_buttons())
+
+    try:
+        yield
+    finally:
+        print("서버 종료...")
+        broadcast_task.cancel()
+        broadcast_btn_task.cancel()
+        if cap and cap.isOpened():
+            cap.release()
 
 app = FastAPI(lifespan=lifespan)
 
@@ -337,48 +353,44 @@ else:
     @app.get("/")
     def root():
         return {"message": "Backend is running, but frontend build is not found."}
-    
-# --- [추가] 버튼 이벤트 공유용 ---
-last_button = None               # 최근 눌린 버튼 (1/2/3)
-button_queue = Queue()           # 실시간 이벤트 전달용 (스레드→async)
-ser_lock = threading.Lock()      # 시리얼 write/read 동시 접근 보호
 
-# --- [추가] 시리얼 수신 전용 스레드 ---
+# --- [추가] 버튼 시리얼 수신 전용 스레드 ---
 def serial_reader_loop():
     global ser, last_button
-    while True:
-        # 포트가 안 열렸으면 재시도
-        if ser is None or not ser.is_open:
-            try:
-                ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
-                print(f"✅ 시리얼 포트 재연결: {SERIAL_PORT}")
-                time.sleep(2)  # 아두이노 리셋 대기
-            except Exception as e:
-                print(f"❌ 시리얼 연결 실패(재시도): {e}")
-                time.sleep(2)
-                continue
+    BTN_DEBOUNCE_MS = 150
+    last_ts = 0.0
 
+    while True:
+        if ser is None or not ser.is_open:
+            time.sleep(0.2)
+            continue
         try:
-            with ser_lock:
+            with serial_lock:
                 raw = ser.readline()
             if not raw:
                 continue
-
             line = raw.decode(errors="ignore").strip()
-            # 버튼 1/2/3만 유효로 처리
-            if line in ("1", "2", "3"):
-                last_button = int(line)
-                # 실시간 브로드캐스트를 위해 큐에 넣기
-                button_queue.put_nowait(last_button)
-                # print(f"[BTN] {last_button}")
+
+            # "BTN:1" 같은 포맷도 허용
+            if line.startswith("BTN:"):
+                line = line.split(":",1)[1].strip()
+
+            if line in ("1","2","3"):
+                now = time.time()
+                if (now - last_ts) * 1000 >= BTN_DEBOUNCE_MS:  # 디바운스
+                    last_button = int(line)
+                    button_queue.put_nowait(last_button)  # 그대로 사용해도 OK
+                    last_ts = now
         except Exception as e:
             print(f"시리얼 읽기 오류: {e}")
             try:
-                ser.close()
+                with serial_lock:
+                    ser.close()
             except:
                 pass
             ser = None
             time.sleep(1)
+
 
 # --- [추가] 버튼 이벤트 브로드캐스트 (큐를 async에서 소비) ---
 async def broadcast_buttons():
