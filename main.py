@@ -23,6 +23,19 @@ PROCESS_DURATION: float = 4.0  # 작업 소요(초) — 필요에 따라 조정
 last_button = None               # 최근 눌린 버튼 (1/2/3)
 button_queue = Queue()           # 실시간 이벤트 전달용 (스레드→async)    # 시리얼 write/read 동시 접근 보호
 
+def ensure_serial_open():
+    global ser
+    if ser is None or not ser.is_open:
+        try:
+            ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+            print(f"[SER] open OK {SERIAL_PORT} {BAUD_RATE}")
+            time.sleep(2)  # 아두이노 리셋 대기
+            return True
+        except Exception as e:
+            print(f"[SER] open FAIL: {e}")
+            ser = None
+            return False
+    return True
 
 # 카메라 설정
 try:
@@ -75,18 +88,6 @@ def detection_loop():
     if cap is None:
         print("카메라가 없으므로 감지 루프를 시작할 수 없습니다.")
         return
-
-    # 시리얼 포트 열기
-    while ser is None:
-        try:
-            ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
-            print(f"시리얼 포트 {SERIAL_PORT} 열기 성공")
-            time.sleep(2) # 아두이노 보드 초기화 시간 대기
-        except Exception as e:
-            print(f"시리얼 포트 열기 실패: {e}")
-            time.sleep(2) # 2초후 재시도
-            ser = None
-
 
     while True:
         ret, frame = cap.read()
@@ -255,7 +256,7 @@ app.add_middleware(
 ## ----------- 아두이노 제어 API (상태 머신 적용) ---------------- ##
 
 def send_serial_command(command: str, show_log: bool = True):
-    if not ser or not ser.is_open:
+    if not ensure_serial_open():
         if show_log: print("시리얼 포트가 열려있지 않습니다.")
         return False, "Serial port not open"
     try:
@@ -418,6 +419,9 @@ def serial_reader_loop():
     while True:
         if ser is None or not ser.is_open:
             time.sleep(0.2)
+            continue
+        if not ensure_serial_open():
+            time.sleep(0.5)
             continue
         try:
             with serial_lock:
