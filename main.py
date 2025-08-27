@@ -326,7 +326,6 @@ async def websocket_endpoint(websocket: WebSocket):
         pass
     try:
         while True:
-            await websocket.receive_text()
             msg = await websocket.receive_text()
             t = msg.strip()
             # 앱-레벨 하트비트에 대응
@@ -339,28 +338,51 @@ async def websocket_endpoint(websocket: WebSocket):
     except WebSocketDisconnect:
         clients.remove(websocket)
         print(f"클라이언트 연결 끊김: {len(clients)}명 접속 중")
-@app.post("/debug/button/{n}")
-async def debug_button(n: int):
-    """테스트용: /debug/button/1|2|3 호출 시 모든 WS 클라이언트에 버튼 이벤트 브로드캐스트"""
-    if n not in (1, 2, 3):
-        return JSONResponse(status_code=400, content={"status":"error","message":"n must be 1,2,3"})
-    payload = json.dumps({"type":"button","value":n,"ts":time.time()})
-    dead = []
-    for ws in list(clients):
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    clients.append(websocket)  # (선택) 버튼 브로드캐스트 용도
+    print(f"[PID {os.getpid()}] WS connect. clients={len(clients)}")
+
+    # 연결 알림 한 번 전송
+    await websocket.send_text(json.dumps({"type": "connected", "ts": time.time()}))
+
+    async def sender():
+        # 주기적으로 감지 JSON을 이 커넥션에 직접 전송
+        while True:
+            with detections_lock:
+                data = latest_detections_json
+            await websocket.send_text(data)
+            await asyncio.sleep(0.1)  # 10fps
+
+    async def receiver():
+        # 클라에서 오는 메시지 처리 (ping 등)
+        while True:
+            msg = await websocket.receive_text()
+            t = (msg or "").strip()
+            if t == "ping" or t == '{"type":"ping"}':
+                await websocket.send_text(json.dumps({"type":"pong","ts":time.time()}))
+                continue
+            # 필요한 메시지 프로토콜 추가 처리 가능
+
+    try:
+        await asyncio.gather(sender(), receiver())
+    except WebSocketDisconnect:
+        pass
+    finally:
+        # 정리
         try:
-            await ws.send_text(payload)
+            clients.remove(websocket)
         except Exception:
-            dead.append(ws)
-    for ws in dead:
-        try: clients.remove(ws)
-        except: pass
-    return {"status":"ok","sent":len(clients)}
+            pass
+        print(f"[PID {os.getpid()}] WS disconnect. clients={len(clients)}")
 
 # MJPEG 영상 스트리밍 (소비자)
 def generate_annotated_frame():
     while True:
         with frame_lock:
             if latest_annotated_frame is None:
+                time.sleep(0.03)
                 continue
             frame_bytes = latest_annotated_frame
         
