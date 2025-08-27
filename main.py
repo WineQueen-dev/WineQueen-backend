@@ -70,7 +70,7 @@ detections_lock = threading.Lock()
 
 # --- 객체 감지 및 데이터 처리 (백그라운드 스레드 - 생산자) ---
 def detection_loop():
-    global latest_annotated_frame, latest_detections_json, cap, ser, SYSTEM_STATE, TARGET_ACTION
+    global latest_annotated_frame, latest_detections_json, cap, ser, SYSTEM_STATE, TARGET_ACTION, PROCESS_START_TIME
 
     if cap is None:
         print("카메라가 없으므로 감지 루프를 시작할 수 없습니다.")
@@ -270,24 +270,26 @@ def send_serial_command(command: str, show_log: bool = True):
 @app.post("/control/seal", tags=["Arduino Control"])
 async def start_sealing():
     """밀봉을 위한 정렬 프로세스를 시작합니다."""
-    global SYSTEM_STATE, TARGET_ACTION
+    global SYSTEM_STATE, TARGET_ACTION, PROCESS_START_TIME
     with state_lock:
         if SYSTEM_STATE != STAY:
             return JSONResponse(status_code=409, content={"status": "error", "message": f"System is busy with '{SYSTEM_STATE}'"})
         SYSTEM_STATE = ALIGNING
         TARGET_ACTION = 'S'
+        PROCESS_START_TIME = None
         print(f"시스템 상태 변경: {STAY} -> {ALIGNING} (목표: 밀봉)")
     return {"status": "ok", "message": "Alignment process for sealing has been started."}
 
 @app.post("/control/open", tags=["Arduino Control"])
 async def start_opening():
     """개봉을 위한 정렬 프로세스를 시작합니다."""
-    global SYSTEM_STATE, TARGET_ACTION
+    global SYSTEM_STATE, TARGET_ACTION, PROCESS_START_TIME
     with state_lock:
         if SYSTEM_STATE != STAY:
             return JSONResponse(status_code=409, content={"status": "error", "message": f"System is busy with '{SYSTEM_STATE}'"})
         SYSTEM_STATE = ALIGNING
         TARGET_ACTION = 'O'
+        PROCESS_START_TIME = None
         print(f"시스템 상태 변경: {STAY} -> {ALIGNING} (목표: 개봉)")
     return {"status": "ok", "message": "Alignment process for opening has been started."}
 
@@ -302,10 +304,11 @@ async def return_to_home():
 @app.post("/control/stop", tags=["Arduino Control"])
 async def emergency_stop():
     """긴급 정지 ('E') 신호를 아두이노에 전송하고 시스템 상태를 초기화합니다."""
-    global SYSTEM_STATE, TARGET_ACTION
+    global SYSTEM_STATE, TARGET_ACTION, PROCESS_START_TIME
     with state_lock:
         SYSTEM_STATE = STAY
         TARGET_ACTION = None
+        PROCESS_START_TIME = None
     success, message = send_serial_command('E')
     if success:
         return {"status": "ok", "message": f"{message}. System state has been reset to '{STAY}'."}
@@ -316,12 +319,42 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     clients.append(websocket)
     print(f"클라이언트 연결: {len(clients)}명 접속 중")
+    # 최초 연결 알림
+    try:
+        await websocket.send_text(json.dumps({"type": "connected", "ts": time.time()}))
+    except Exception:
+        pass
     try:
         while True:
             await websocket.receive_text()
+            msg = await websocket.receive_text()
+            t = msg.strip()
+            # 앱-레벨 하트비트에 대응
+            if t == "ping" or t == '{"type":"ping"}':
+                try:
+                    await websocket.send_text(json.dumps({"type": "pong", "ts": time.time()}))
+                except Exception:
+                    pass
+                continue
     except WebSocketDisconnect:
         clients.remove(websocket)
         print(f"클라이언트 연결 끊김: {len(clients)}명 접속 중")
+@app.post("/debug/button/{n}")
+async def debug_button(n: int):
+    """테스트용: /debug/button/1|2|3 호출 시 모든 WS 클라이언트에 버튼 이벤트 브로드캐스트"""
+    if n not in (1, 2, 3):
+        return JSONResponse(status_code=400, content={"status":"error","message":"n must be 1,2,3"})
+    payload = json.dumps({"type":"button","value":n,"ts":time.time()})
+    dead = []
+    for ws in list(clients):
+        try:
+            await ws.send_text(payload)
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        try: clients.remove(ws)
+        except: pass
+    return {"status":"ok","sent":len(clients)}
 
 # MJPEG 영상 스트리밍 (소비자)
 def generate_annotated_frame():
@@ -406,6 +439,15 @@ async def broadcast_buttons():
             )
         except Exception as e:
             print(f"버튼 브로드캐스트 오류: {e}")
+        dead = []
+        for ws in list(clients):
+            try:
+                await ws.send_text(payload)
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            try: clients.remove(ws)
+            except: pass
 
 if __name__ == "__main__":
     import uvicorn
