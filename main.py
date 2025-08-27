@@ -198,8 +198,6 @@ def detection_loop():
 
         time.sleep(0.03) # CPU 사용량 조절
 
-    if ser and ser.is_open:
-        ser.close() # 루프 종료 시 시리얼 포트 닫기
     cap.release()
 
 # --- 웹소켓 데이터 브로드캐스팅 (소비자) ---
@@ -208,7 +206,6 @@ async def broadcast_detections():
         data = None
         with detections_lock:
             data = latest_detections_json
-
         dead = []
         for ws in list(clients):   # 스냅샷 반복
             try:
@@ -318,30 +315,6 @@ async def emergency_stop():
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    clients.append(websocket)
-    print(f"클라이언트 연결: {len(clients)}명 접속 중")
-    # 최초 연결 알림
-    try:
-        await websocket.send_text(json.dumps({"type": "connected", "ts": time.time()}))
-    except Exception:
-        pass
-    try:
-        while True:
-            msg = await websocket.receive_text()
-            t = msg.strip()
-            # 앱-레벨 하트비트에 대응
-            if t == "ping" or t == '{"type":"ping"}':
-                try:
-                    await websocket.send_text(json.dumps({"type": "pong", "ts": time.time()}))
-                except Exception:
-                    pass
-                continue
-    except WebSocketDisconnect:
-        clients.remove(websocket)
-        print(f"클라이언트 연결 끊김: {len(clients)}명 접속 중")
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
     clients.append(websocket)  # (선택) 버튼 브로드캐스트 용도
     print(f"[PID {os.getpid()}] WS connect. clients={len(clients)}")
 
@@ -417,9 +390,6 @@ def serial_reader_loop():
     last_ts = 0.0
 
     while True:
-        if ser is None or not ser.is_open:
-            time.sleep(0.2)
-            continue
         if not ensure_serial_open():
             time.sleep(0.5)
             continue
@@ -458,13 +428,7 @@ async def broadcast_buttons():
         # blocking Queue.get()를 안전하게 실행
         btn = await loop.run_in_executor(None, button_queue.get)
         payload = json.dumps({"type": "button", "value": btn, "ts": time.time()})
-        try:
-            await asyncio.gather(
-                *[ws.send_text(payload) for ws in clients],
-                return_exceptions=False
-            )
-        except Exception as e:
-            print(f"버튼 브로드캐스트 오류: {e}")
+        print(f"[WS] broadcasting button={btn} to {len(clients)} clients")
         dead = []
         for ws in list(clients):
             try:
