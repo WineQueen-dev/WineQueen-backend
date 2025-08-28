@@ -392,7 +392,7 @@ def generate_annotated_frame():
         
         yield (b"--frame\r\n"
                b"Content-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n")
-        time.sleep(0.03)
+        time.sleep(0.02)
 
 @app.get("/video_feed")
 def video_feed():
