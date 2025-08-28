@@ -23,6 +23,16 @@ PROCESS_DURATION: float = 4.0  # 작업 소요(초) — 필요에 따라 조정
 last_button = None               # 최근 눌린 버튼 (1/2/3)
 button_queue = Queue()           # 실시간 이벤트 전달용 (스레드→async)    # 시리얼 write/read 동시 접근 보호
 
+#욜로 디버깅용 코드
+_last_align_print = 0.0
+def align_log(msg, every=0.5):
+    """every 초마다 한 번만 출력 (로그 과다 방지)"""
+    global _last_align_print
+    now = time.time()
+    if now - _last_align_print >= every:
+        print(msg, flush=True)
+        _last_align_print = now
+
 def ensure_serial_open():
     global ser
     if ser is None or not ser.is_open:
@@ -108,7 +118,7 @@ def detection_loop():
     global latest_annotated_frame, latest_detections_json, cap, ser, SYSTEM_STATE, TARGET_ACTION, PROCESS_START_TIME
 
     if cap is None:
-        print("카메라가 없으므로 감지 루프를 시작할 수 없습니다.")
+        print("No Camere")
         return
 
     while True:
@@ -119,7 +129,7 @@ def detection_loop():
 
         ret, frame = cap.read()
         if not ret:
-            print("프레임 읽기 실패. 루프를 종료합니다.")
+            print("fail")
             break
             print("[CAM] read fail, will retry...")
             time.sleep(0.2)
@@ -132,7 +142,7 @@ def detection_loop():
             # 밀봉 또는 개봉 작업이 진행 중일 때, 시간이 다 되었는지 확인
             if current_state in [SEALING, OPENING] and PROCESS_START_TIME is not None:
                 if time.time() - PROCESS_START_TIME > PROCESS_DURATION:
-                    print(f"✅ 작업 시간({PROCESS_DURATION}초) 경과. 시스템 상태를 '{STAY}'로 복귀합니다.")
+                    print(f"✅ time({PROCESS_DURATION}second) 경과. 시스템 상태를 '{STAY}'로 복귀합니다.")
                     SYSTEM_STATE = STAY
                     TARGET_ACTION = None
                     PROCESS_START_TIME = None
@@ -167,12 +177,11 @@ def detection_loop():
 
                 # --- 시리얼 통신을 위한 데이터 결정 (데드존 적용) ---
                 deadzone_pixels = 10  # 좌우 10픽셀을 데드존으로 설정
+                conf_val = float(first_box.conf[0])
                 
                 if relative_x < -deadzone_pixels:
-                    print('left')
                     serial_data_to_send = '0' # 와인이 중심보다 왼쪽에 있음
                 elif relative_x > deadzone_pixels:
-                    print('right')
                     serial_data_to_send = '1' # 와인이 중심보다 오른쪽에 있음
                 else:
                     serial_data_to_send = '2' # 와인이 중앙 데드존 안에 위치함 (정렬 완료)
@@ -196,6 +205,7 @@ def detection_loop():
             
             # 3. 정렬 신호 전송
             print(serial_data_to_send)
+            align_log(f"[ALIGN] dir={serial_data_to_send} rel_x={relative_x} conf={conf_val}", every=0.5)
             send_serial_command(serial_data_to_send, show_log=False)
         
         # 웹소켓 및 영상 스트리밍을 위한 화면 그리기는 상태와 상관없이 항상 수행
@@ -287,7 +297,7 @@ app.add_middleware(
 
 def send_serial_command(command: str, show_log: bool = True):
     if not ensure_serial_open():
-        if show_log: print("시리얼 포트가 열려있지 않습니다.")
+        if show_log: print("not open")
         return False, "Serial port not open"
     try:
         with serial_lock:
