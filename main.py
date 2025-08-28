@@ -78,7 +78,7 @@ except Exception as e:
     cap = None
 
 # 시리얼 통신 설정
-SERIAL_PORT = '/dev/ttyAMA10' 
+SERIAL_PORT = '/dev/ttyACM0' 
 BAUD_RATE = 9600 # 아두이노 스케치에서 설정한 보드레이트와 동일하게 맞춰야 합니다.
 ser = None # 시리얼 객체 초기화
 
@@ -190,11 +190,13 @@ def detection_loop():
                         TARGET_ACTION = None # 목표 작업 초기화
                 
             else: # 감지된 객체가 없을 경우(예외처리)
+                print('no merc')
                 serial_data_to_send = '3' # 예를 들어, 와인이 감지되지 않았음을 알리는 코드 (선택 사항)
                                         # 아두이노에서 이 경우를 어떻게 처리할지 정의해야 함
             
             # 3. 정렬 신호 전송
             send_serial_command(serial_data_to_send, show_log=False)
+            print('sucesss')
         
         # 웹소켓 및 영상 스트리밍을 위한 화면 그리기는 상태와 상관없이 항상 수행
         if results.boxes:
@@ -293,7 +295,7 @@ def send_serial_command(command: str, show_log: bool = True):
         if show_log: print(f"Serial command sent: '{command}'")
         return True, f"Command '{command}' sent"
     except Exception as e:
-        if show_log: print(f"시리얼 명령 전송 실패: {e}")
+        if show_log: print(f"serial command send fail: {e}")
         return False, str(e)
 
 @app.post("/control/seal", tags=["Arduino Control"])
