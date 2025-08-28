@@ -129,8 +129,6 @@ def detection_loop():
 
         ret, frame = cap.read()
         if not ret:
-            print("fail")
-            break
             print("[CAM] read fail, will retry...")
             time.sleep(0.2)
             continue
