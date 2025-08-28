@@ -193,6 +193,7 @@ def detection_loop():
                                         # 아두이노에서 이 경우를 어떻게 처리할지 정의해야 함
             
             # 3. 정렬 신호 전송
+            print(serial_data_to_send)
             send_serial_command(serial_data_to_send, show_log=False)
         
         # 웹소켓 및 영상 스트리밍을 위한 화면 그리기는 상태와 상관없이 항상 수행
