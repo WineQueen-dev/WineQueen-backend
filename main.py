@@ -195,8 +195,7 @@ def detection_loop():
                                         # 아두이노에서 이 경우를 어떻게 처리할지 정의해야 함
             
             # 3. 정렬 신호 전송
-            send_serial_command(serial_data_to_send, show_log=False)
-            print('sucesss')
+            send_serial_command(serial_data_to_send, show_log=True)
         
         # 웹소켓 및 영상 스트리밍을 위한 화면 그리기는 상태와 상관없이 항상 수행
         if results.boxes:
@@ -286,6 +285,7 @@ app.add_middleware(
 ## ----------- 아두이노 제어 API (상태 머신 적용) ---------------- ##
 
 def send_serial_command(command: str, show_log: bool = True):
+    print('send function success')
     if not ensure_serial_open():
         if show_log: print("not open")
         return False, "Serial port not open"
