@@ -78,7 +78,7 @@ except Exception as e:
     cap = None
 
 # 시리얼 통신 설정
-SERIAL_PORT = '/dev/ttyUSB0' 
+SERIAL_PORT = '/dev/ttyAMA10' 
 BAUD_RATE = 9600 # 아두이노 스케치에서 설정한 보드레이트와 동일하게 맞춰야 합니다.
 ser = None # 시리얼 객체 초기화
 
