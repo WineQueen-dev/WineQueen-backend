@@ -32,7 +32,6 @@ def align_log(msg, every=0.5):
     if now - _last_align_print >= every:
         print(msg, flush=True)
         _last_align_print = now     
-_last_tick = 0.0
 #이 위로 다 디버깅용
 
 def ensure_serial_open():
@@ -134,11 +133,7 @@ def detection_loop():
             print("[CAM] read fail, will retry...")
             time.sleep(0.2)
             continue
-        if ret:
-            now = time.time()
-            if now - _last_tick > 0.5:
-                print("[TICK] detection loop alive", flush=True)
-                _last_tick = now
+        print('good rotate')
         
          # --- [수정] 비디오 스트리밍 멈춤 없는 상태 관리 ---
         with state_lock:
