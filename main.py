@@ -169,8 +169,10 @@ def detection_loop():
                 deadzone_pixels = 10  # 좌우 10픽셀을 데드존으로 설정
                 
                 if relative_x < -deadzone_pixels:
+                    print('left')
                     serial_data_to_send = '0' # 와인이 중심보다 왼쪽에 있음
                 elif relative_x > deadzone_pixels:
+                    print('right')
                     serial_data_to_send = '1' # 와인이 중심보다 오른쪽에 있음
                 else:
                     serial_data_to_send = '2' # 와인이 중앙 데드존 안에 위치함 (정렬 완료)
