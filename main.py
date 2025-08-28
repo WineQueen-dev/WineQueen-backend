@@ -23,17 +23,6 @@ PROCESS_DURATION: float = 4.0  # 작업 소요(초) — 필요에 따라 조정
 last_button = None               # 최근 눌린 버튼 (1/2/3)
 button_queue = Queue()           # 실시간 이벤트 전달용 (스레드→async)    # 시리얼 write/read 동시 접근 보호
 
-#욜로 디버깅용 코드
-_last_align_print = 0.0
-def align_log(msg, every=0.5):
-    """every 초마다 한 번만 출력 (로그 과다 방지)"""
-    global _last_align_print
-    now = time.time()
-    if now - _last_align_print >= every:
-        print(msg, flush=True)
-        _last_align_print = now     
-#이 위로 다 디버깅용
-
 def ensure_serial_open():
     global ser
     if ser is None or not ser.is_open:
@@ -133,7 +122,6 @@ def detection_loop():
             print("[CAM] read fail, will retry...")
             time.sleep(0.2)
             continue
-        print('good rotate')
         
          # --- [수정] 비디오 스트리밍 멈춤 없는 상태 관리 ---
         with state_lock:
@@ -164,6 +152,7 @@ def detection_loop():
         detections = []
         # 2. 결과 처리 및 화면 그리기
         # --- 상태가 ALIGNING일 때만 위치 보정 신호를 보냄 
+        start_sealing()
         if current_state == ALIGNING:
             serial_data_to_send = '2' # 기본값: 동일 (2)
         
@@ -181,8 +170,10 @@ def detection_loop():
                 
                 if relative_x < -deadzone_pixels:
                     serial_data_to_send = '0' # 와인이 중심보다 왼쪽에 있음
+                    print('left')
                 elif relative_x > deadzone_pixels:
                     serial_data_to_send = '1' # 와인이 중심보다 오른쪽에 있음
+                    print('right')
                 else:
                     serial_data_to_send = '2' # 와인이 중앙 데드존 안에 위치함 (정렬 완료)
                     # 정렬 완료 시, 목표했던 작업(밀봉/개봉) 신호 전송
@@ -204,8 +195,6 @@ def detection_loop():
                                         # 아두이노에서 이 경우를 어떻게 처리할지 정의해야 함
             
             # 3. 정렬 신호 전송
-            print(serial_data_to_send)
-            align_log(f"[ALIGN] dir={serial_data_to_send} rel_x={relative_x} conf={conf_val}", every=0.5)
             send_serial_command(serial_data_to_send, show_log=False)
         
         # 웹소켓 및 영상 스트리밍을 위한 화면 그리기는 상태와 상관없이 항상 수행
@@ -318,7 +307,7 @@ async def start_sealing():
         SYSTEM_STATE = ALIGNING
         TARGET_ACTION = 'S'
         PROCESS_START_TIME = None
-        print(f"시스템 상태 변경: {STAY} -> {ALIGNING} (목표: 밀봉)")
+        print(f"SystemState Change: {STAY} -> {ALIGNING} (목표: 밀봉)")
     return {"status": "ok", "message": "Alignment process for sealing has been started."}
 
 @app.post("/control/open", tags=["Arduino Control"])
