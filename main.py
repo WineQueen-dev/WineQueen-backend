@@ -149,7 +149,7 @@ def detection_loop():
         # --- 끝 ---
 
         # 1. AI 추론 (여기서 딱 한 번만 실행)
-        results = model(frame, classes=0, conf=0.9, verbose=False)[0]
+        results = model(frame, classes=0, conf=0.8, verbose=False)[0]
         
         detections = []
         # 2. 결과 처리 및 화면 그리기
