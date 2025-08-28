@@ -152,7 +152,6 @@ def detection_loop():
         detections = []
         # 2. 결과 처리 및 화면 그리기
         # --- 상태가 ALIGNING일 때만 위치 보정 신호를 보냄 
-        start_sealing()
         if current_state == ALIGNING:
             serial_data_to_send = '2' # 기본값: 동일 (2)
         
