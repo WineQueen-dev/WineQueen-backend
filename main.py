@@ -37,6 +37,28 @@ def ensure_serial_open():
             return False
     return True
 
+# 카메라 오픈
+def ensure_camera_open():
+    global cap
+    if cap is not None and cap.isOpened():
+        return True
+    try:
+        device = "/dev/video0"  # 필요시 바꾸세요
+        cap = cv2.VideoCapture(device, cv2.CAP_V4L2)  # V4L2 명시
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        if cap.isOpened():
+            print(f"[CAM] open OK {device}")
+            return True
+        else:
+            print(f"[CAM] open FAIL {device}")
+            cap = None
+            return False
+    except Exception as e:
+        print(f"[CAM] exception: {e}")
+        cap = None
+        return False
+
 # 카메라 설정
 try:
     # [변경점] 카메라 인덱스(8) 대신, 터미널에서 확인한 장치 경로를 직접 입력합니다.
@@ -90,10 +112,18 @@ def detection_loop():
         return
 
     while True:
+        # 카메라가 닫혀 있으면 재시도
+        if not ensure_camera_open():
+            time.sleep(1.0)
+            continue
+
         ret, frame = cap.read()
         if not ret:
             print("프레임 읽기 실패. 루프를 종료합니다.")
             break
+            print("[CAM] read fail, will retry...")
+            time.sleep(0.2)
+            continue
         
          # --- [수정] 비디오 스트리밍 멈춤 없는 상태 관리 ---
         with state_lock:
