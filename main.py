@@ -19,6 +19,16 @@ import serial # 시리얼 통신 라이브러리
 model = YOLO("best_wCrop.pt")   
 PROCESS_START_TIME: float | None = None
 PROCESS_DURATION: float = 4.0  # 작업 소요(초) — 필요에 따라 조정
+# --- YOLO 추론 토글 ---
+YOLO_ON = False
+
+def set_yolo_active(active: bool):
+    """YOLO 추론 사용 토글 (카메라는 그대로 유지)."""
+    global YOLO_ON
+    with state_lock:
+        YOLO_ON = active
+    print(f"[YOLO] {'ON' if active else 'OFF'}")
+
 # --- [추가] 버튼 이벤트 공유용 ---
 last_button = None               # 최근 눌린 버튼 (1/2/3)
 button_queue = Queue()           # 실시간 이벤트 전달용 (스레드→async)    # 시리얼 write/read 동시 접근 보호
@@ -107,10 +117,6 @@ detections_lock = threading.Lock()
 def detection_loop():
     global latest_annotated_frame, latest_detections_json, cap, ser, SYSTEM_STATE, TARGET_ACTION, PROCESS_START_TIME
 
-    if cap is None:
-        print("No Camere")
-        return
-
     while True:
         # 카메라가 닫혀 있으면 재시도
         if not ensure_camera_open():
@@ -126,7 +132,7 @@ def detection_loop():
          # --- [수정] 비디오 스트리밍 멈춤 없는 상태 관리 ---
         with state_lock:
             current_state = SYSTEM_STATE
-            
+            yolo_active = YOLO_ON
             # 밀봉 또는 개봉 작업이 진행 중일 때, 시간이 다 되었는지 확인
             if current_state in [SEALING, OPENING] and PROCESS_START_TIME is not None:
                 if time.time() - PROCESS_START_TIME > PROCESS_DURATION:
@@ -134,6 +140,8 @@ def detection_loop():
                     SYSTEM_STATE = STAY
                     TARGET_ACTION = None
                     PROCESS_START_TIME = None
+                    YOLO_ON = False
+                    yolo_active = False
         # --- [수정] 끝 ---
 
         # --- 카메라 중심 좌표 계산 및 표시 ---
@@ -150,49 +158,53 @@ def detection_loop():
         results = model(frame, classes=0, conf=0.8, verbose=False)[0]
         
         detections = []
+        results = None
         # 2. 결과 처리 및 화면 그리기
         # --- 상태가 ALIGNING일 때만 위치 보정 신호를 보냄 
-        if current_state == ALIGNING:
-            serial_data_to_send = '2' # 기본값: 동일 (2)
-        
-            if results.boxes:
-                first_box = results.boxes[0]
-                x1, y1, x2, y2 = map(int, first_box.xyxy[0])
-                # --- 객체 중심의 상대 좌표 계산 ---
-                obj_center_x = (x1 + x2) // 2
-                # 카메라 중심을 (0,0)으로 하는 상대 좌표
-                relative_x = obj_center_x - cam_center_x
 
-                # --- 시리얼 통신을 위한 데이터 결정 (데드존 적용) ---
-                deadzone_pixels = 10  # 좌우 10픽셀을 데드존으로 설정
-                conf_val = float(first_box.conf[0])
-                
-                if relative_x < -deadzone_pixels:
-                    serial_data_to_send = 'left' # 와인이 중심보다 왼쪽에 있음
-                    print('left')
-                elif relative_x > deadzone_pixels:
-                    serial_data_to_send = 'right' # 와인이 중심보다 오른쪽에 있음
-                    print('right')
-                else:
-                    serial_data_to_send = 'center' # 와인이 중앙 데드존 안에 위치함 (정렬 완료)
-                    # 정렬 완료 시, 목표했던 작업(밀봉/개봉) 신호 전송
-                    if TARGET_ACTION:
-                        print(f"정렬 완료! 목표 작업 '{TARGET_ACTION}' 신호를 전송합니다.")
-                        send_serial_command(TARGET_ACTION)
-                        
-                        # 상태 변경
-                        if TARGET_ACTION == 'S':
-                            SYSTEM_STATE = SEALING
-                        elif TARGET_ACTION == 'O':
-                            SYSTEM_STATE = OPENING
-                        
-                        PROCESS_START_TIME = time.time() # 작업 시작 시간 기록
-                        TARGET_ACTION = None # 목표 작업 초기화
-                
-            else: # 감지된 객체가 없을 경우(예외처리)
-                print('no merc')
-                serial_data_to_send = '3' # 예를 들어, 와인이 감지되지 않았음을 알리는 코드 (선택 사항)
-                                        # 아두이노에서 이 경우를 어떻게 처리할지 정의해야 함
+        # ✅ YOLO가 켜진 경우에만 추론/정렬 수행
+        if yolo_active:
+            results = model(frame, classes=0, conf=0.8, verbose=False)[0]
+            if current_state == ALIGNING:
+                serial_data_to_send = '2' # 기본값: 동일 (2)
+            
+                if results.boxes:
+                    first_box = results.boxes[0]
+                    x1, y1, x2, y2 = map(int, first_box.xyxy[0])
+                    # --- 객체 중심의 상대 좌표 계산 ---
+                    obj_center_x = (x1 + x2) // 2
+                    # 카메라 중심을 (0,0)으로 하는 상대 좌표
+                    relative_x = obj_center_x - cam_center_x
+
+                    # --- 시리얼 통신을 위한 데이터 결정 (데드존 적용) ---
+                    deadzone_pixels = 10  # 좌우 10픽셀을 데드존으로 설정
+                    conf_val = float(first_box.conf[0])
+                    
+                    if relative_x < -deadzone_pixels:
+                        serial_data_to_send = 'left' # 와인이 중심보다 왼쪽에 있음
+                        print('left')
+                    elif relative_x > deadzone_pixels:
+                        serial_data_to_send = 'right' # 와인이 중심보다 오른쪽에 있음
+                        print('right')
+                    else:
+                        serial_data_to_send = 'center' # 와인이 중앙 데드존 안에 위치함 (정렬 완료)
+                        # 정렬 완료 시, 목표했던 작업(밀봉/개봉) 신호 전송
+                        if TARGET_ACTION:
+                            print(f"정렬 완료! 목표 작업 '{TARGET_ACTION}' 신호를 전송합니다.")
+                            send_serial_command(TARGET_ACTION)
+                            
+                            # 상태 변경
+                            if TARGET_ACTION == 'S':
+                                SYSTEM_STATE = SEALING
+                            elif TARGET_ACTION == 'O':
+                                SYSTEM_STATE = OPENING
+                            
+                            PROCESS_START_TIME = time.time() # 작업 시작 시간 기록
+                            TARGET_ACTION = None # 목표 작업 초기화
+                    
+                else: # 감지된 객체가 없을 경우(예외처리)
+                    print('no merc')
+                    serial_data_to_send = 'nowine' # 예를 들어, 와인이 감지되지 않았음을 알리는 코드 (선택 사항)
             
             # 3. 정렬 신호 전송
             send_serial_command(serial_data_to_send, show_log=True)
@@ -302,6 +314,7 @@ def send_serial_command(command: str, show_log: bool = True):
 async def start_sealing():
     """밀봉을 위한 정렬 프로세스를 시작합니다."""
     global SYSTEM_STATE, TARGET_ACTION, PROCESS_START_TIME
+    set_yolo_active(True)
     with state_lock:
         if SYSTEM_STATE != STAY:
             return JSONResponse(status_code=409, content={"status": "error", "message": f"System is busy with '{SYSTEM_STATE}'"})
@@ -315,6 +328,7 @@ async def start_sealing():
 async def start_opening():
     """개봉을 위한 정렬 프로세스를 시작합니다."""
     global SYSTEM_STATE, TARGET_ACTION, PROCESS_START_TIME
+    set_yolo_active(True)
     with state_lock:
         if SYSTEM_STATE != STAY:
             return JSONResponse(status_code=409, content={"status": "error", "message": f"System is busy with '{SYSTEM_STATE}'"})
@@ -340,6 +354,7 @@ async def emergency_stop():
         SYSTEM_STATE = STAY
         TARGET_ACTION = None
         PROCESS_START_TIME = None
+    set_yolo_active(False)
     success, message = send_serial_command('E')
     if success:
         return {"status": "ok", "message": f"{message}. System state has been reset to '{STAY}'."}
@@ -441,6 +456,11 @@ def serial_reader_loop():
                 now = time.time()
                 if (now - last_ts) * 1000 >= BTN_DEBOUNCE_MS:  # 디바운스
                     last_button = int(line)
+
+                    # ✅ 버튼 1/2에서 YOLO 추론 ON
+                    if last_button in (1, 2):
+                        set_yolo_active(True)
+
                     button_queue.put_nowait(last_button)  # 그대로 사용해도 OK
                     last_ts = now
         except Exception as e:
