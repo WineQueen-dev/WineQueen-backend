@@ -59,23 +59,24 @@ def ensure_camera_open():
         cap = None
         return False
 
-# 카메라 설정
-try:
-    # [변경점] 카메라 인덱스(8) 대신, 터미널에서 확인한 장치 경로를 직접 입력합니다.
-    # 예시로 /dev/video0 을 사용했으며, 실제 확인된 경로로 수정해주세요.
-    CAMERA_DEVICE_PATH = "/dev/video0" 
-    cap = cv2.VideoCapture(CAMERA_DEVICE_PATH)
-    
-    if not cap.isOpened():
-        raise IOError(f"Cannot open webcam: {CAMERA_DEVICE_PATH}")
-        
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-    print(f"카메라 초기화 성공: {CAMERA_DEVICE_PATH}")
 
-except Exception as e:
-    print(f"카메라 초기화 실패: {e}")
-    cap = None
+CAMERA_DEVICE_PATH = "/dev/video0" 
+cap = None
+# --- 카메라 활성화 토글 ---
+CAMERA_ON = False  # 버튼 1/2 때만 True
+
+def set_camera_active(active: bool):
+    """카메라 사용 토글. False면 장치도 즉시 해제."""
+    global CAMERA_ON, cap
+    with state_lock:
+        CAMERA_ON = active
+        if not active and cap is not None and getattr(cap, "isOpened", lambda: False)():
+            try:
+                cap.release()
+                print("[CAM] released (inactive)")
+            except Exception:
+                pass
+            cap = None
 
 # 시리얼 통신 설정
 SERIAL_PORT = '/dev/ttyUSB0' 
@@ -107,14 +108,19 @@ detections_lock = threading.Lock()
 def detection_loop():
     global latest_annotated_frame, latest_detections_json, cap, ser, SYSTEM_STATE, TARGET_ACTION, PROCESS_START_TIME
 
-    if cap is None:
-        print("No Camere")
-        return
-
     while True:
-        # 카메라가 닫혀 있으면 재시도
+        # 버튼/API로 켜질 때까지 대기
+        with state_lock:
+            active = CAMERA_ON
+            current_state = SYSTEM_STATE
+
+        if not active:
+            time.sleep(0.05)
+            continue
+
+        # 카메라 오픈 시도
         if not ensure_camera_open():
-            time.sleep(1.0)
+            time.sleep(0.5)
             continue
 
         ret, frame = cap.read()
@@ -134,7 +140,9 @@ def detection_loop():
                     SYSTEM_STATE = STAY
                     TARGET_ACTION = None
                     PROCESS_START_TIME = None
-        # --- [수정] 끝 ---
+                    # 작업 끝나면 카메라도 끄기
+                    CAMERA_ON = False
+                    # 다음 루프에서 set_camera_active(False)로 release 되도록 함
 
         # --- 카메라 중심 좌표 계산 및 표시 ---
         h, w, _ = frame.shape
@@ -302,6 +310,7 @@ def send_serial_command(command: str, show_log: bool = True):
 async def start_sealing():
     """밀봉을 위한 정렬 프로세스를 시작합니다."""
     global SYSTEM_STATE, TARGET_ACTION, PROCESS_START_TIME
+    set_camera_active(True) 
     with state_lock:
         if SYSTEM_STATE != STAY:
             return JSONResponse(status_code=409, content={"status": "error", "message": f"System is busy with '{SYSTEM_STATE}'"})
@@ -315,6 +324,7 @@ async def start_sealing():
 async def start_opening():
     """개봉을 위한 정렬 프로세스를 시작합니다."""
     global SYSTEM_STATE, TARGET_ACTION, PROCESS_START_TIME
+    set_camera_active(True) 
     with state_lock:
         if SYSTEM_STATE != STAY:
             return JSONResponse(status_code=409, content={"status": "error", "message": f"System is busy with '{SYSTEM_STATE}'"})
@@ -340,6 +350,7 @@ async def emergency_stop():
         SYSTEM_STATE = STAY
         TARGET_ACTION = None
         PROCESS_START_TIME = None
+    set_camera_active(False) 
     success, message = send_serial_command('E')
     if success:
         return {"status": "ok", "message": f"{message}. System state has been reset to '{STAY}'."}
@@ -441,6 +452,11 @@ def serial_reader_loop():
                 now = time.time()
                 if (now - last_ts) * 1000 >= BTN_DEBOUNCE_MS:  # 디바운스
                     last_button = int(line)
+
+                    # ✅ 버튼 1/2에서 카메라 ON
+                    if last_button in (1, 2):
+                        set_camera_active(True)
+
                     button_queue.put_nowait(last_button)  # 그대로 사용해도 OK
                     last_ts = now
         except Exception as e:
