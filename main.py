@@ -153,9 +153,6 @@ def detection_loop():
         cv2.putText(frame, "(0, 0)", (cam_center_x + 10, cam_center_y + 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
         # --- 끝 ---
-
-        # 1. AI 추론 (여기서 딱 한 번만 실행)
-        results = model(frame, classes=0, conf=0.8, verbose=False)[0]
         
         detections = []
         results = None
@@ -206,31 +203,36 @@ def detection_loop():
                     print('no merc')
                     serial_data_to_send = 'nowine' # 예를 들어, 와인이 감지되지 않았음을 알리는 코드 (선택 사항)
             
-            # 3. 정렬 신호 전송
-            send_serial_command(serial_data_to_send, show_log=True)
+            # 3. 정렬 신호 전송 값이 있을 때만 송신
+                if serial_data_to_send is not None:
+                    send_serial_command(serial_data_to_send, show_log=True)
         
-        # 웹소켓 및 영상 스트리밍을 위한 화면 그리기는 상태와 상관없이 항상 수행
-        if results.boxes:
-            first_box = results.boxes[0]
-            x1, y1, x2, y2 = map(int, first_box.xyxy[0])
-            conf = float(first_box.conf[0])
-            class_id = int(first_box.cls[0])
-            class_name = model.names[class_id]
-            obj_center_x = (x1 + x2) // 2
-            obj_center_y = (y1 + y2) // 2
-            relative_x = obj_center_x - cam_center_x
-            relative_y = cam_center_y - obj_center_y
+            # 웹소켓 및 영상 스트리밍을 위한 화면 그리기는 상태와 상관없이 항상 수행
+            if results.boxes:
+                first_box = results.boxes[0]
+                x1, y1, x2, y2 = map(int, first_box.xyxy[0])
+                conf = float(first_box.conf[0])
+                class_id = int(first_box.cls[0])
+                class_name = model.names[class_id]
+                obj_center_x = (x1 + x2) // 2
+                obj_center_y = (y1 + y2) // 2
+                relative_x = obj_center_x - cam_center_x
+                relative_y = cam_center_y - obj_center_y
 
-            detections.append({
-                "x": x1, "y": y1, "w": x2 - x1, "h": y2 - y1,
-                "conf": conf, "class_id": class_id, "class_name": class_name,
-                "relative_center": {"x": relative_x, "y": relative_y}
-            })
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            label_text = f"{class_name} {conf:.2f}"
-            cv2.putText(frame, label_text, (x1, y1 - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-            coord_text = f"({relative_x}, {relative_y})"
-            cv2.putText(frame, coord_text, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                detections.append({
+                    "x": x1, "y": y1, "w": x2 - x1, "h": y2 - y1,
+                    "conf": conf, "class_id": class_id, "class_name": class_name,
+                    "relative_center": {"x": relative_x, "y": relative_y}
+                })
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                label_text = f"{class_name} {conf:.2f}"
+                cv2.putText(frame, label_text, (x1, y1 - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                coord_text = f"({relative_x}, {relative_y})"
+                cv2.putText(frame, coord_text, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        else:
+            # 선택: YOLO OFF 워터마크
+            cv2.putText(frame, "YOLO: OFF", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
         # 4. 처리된 결과물을 스레드 안전하게 전역 변수에 저장
         with detections_lock:
