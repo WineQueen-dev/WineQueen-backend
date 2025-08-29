@@ -168,13 +168,13 @@ def detection_loop():
                 conf_val = float(first_box.conf[0])
                 
                 if relative_x < -deadzone_pixels:
-                    serial_data_to_send = '0' # 와인이 중심보다 왼쪽에 있음
+                    serial_data_to_send = 'left' # 와인이 중심보다 왼쪽에 있음
                     print('left')
                 elif relative_x > deadzone_pixels:
-                    serial_data_to_send = '1' # 와인이 중심보다 오른쪽에 있음
+                    serial_data_to_send = 'right' # 와인이 중심보다 오른쪽에 있음
                     print('right')
                 else:
-                    serial_data_to_send = '2' # 와인이 중앙 데드존 안에 위치함 (정렬 완료)
+                    serial_data_to_send = 'center' # 와인이 중앙 데드존 안에 위치함 (정렬 완료)
                     # 정렬 완료 시, 목표했던 작업(밀봉/개봉) 신호 전송
                     if TARGET_ACTION:
                         print(f"정렬 완료! 목표 작업 '{TARGET_ACTION}' 신호를 전송합니다.")
