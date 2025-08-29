@@ -189,6 +189,7 @@ def detection_loop():
                         if TARGET_ACTION:
                             print(f"정렬 완료! 목표 작업 '{TARGET_ACTION}' 신호를 전송합니다.")
                             send_serial_command(TARGET_ACTION)
+                            set_yolo_active(False)
                             
                             # 상태 변경
                             if TARGET_ACTION == 'S':
