@@ -11,17 +11,23 @@ import time
 import os
 import asyncio
 from queue import Queue
+import serial  # 시리얼 통신 라이브러리
+import numpy as np # 처음에 바로 yolo키기 위한 임포트
 
-import serial # 시리얼 통신 라이브러리 
+# =========================
+# 전역 설정/상수
+# ========================
+model = YOLO("best_wCrop.pt")
+model.fuse()
 
-# --- 전역 변수 및 설정 ---
-# YOLO 모델 로드 (학습된 커스텀 모델)
-model = YOLO("best_wCrop.pt")   
-PROCESS_START_TIME: float | None = None
-PROCESS_DURATION: float = 4.0  # 작업 소요(초) — 필요에 따라 조정
-# --- YOLO 추론 토글 ---
+# 카메라/시리얼 전역 핸들 (❗️추가: cap 초기화)
+cap = None
+SERIAL_PORT = '/dev/ttyACM0'
+BAUD_RATE = 9600
+ser = None
+
+# YOLO 토글
 YOLO_ON = False
-
 def set_yolo_active(active: bool):
     """YOLO 추론 사용 토글 (카메라는 그대로 유지)."""
     global YOLO_ON
@@ -29,10 +35,32 @@ def set_yolo_active(active: bool):
         YOLO_ON = active
     print(f"[YOLO] {'ON' if active else 'OFF'}")
 
-# --- [추가] 버튼 이벤트 공유용 ---
-last_button = None               # 최근 눌린 버튼 (1/2/3)
-button_queue = Queue()           # 실시간 이벤트 전달용 (스레드→async)    # 시리얼 write/read 동시 접근 보호
+# 버튼 이벤트 큐
+last_button = None
+button_queue = Queue()
 
+# 상태 머신
+STAY = "STAY"
+ALIGNING = "ALIGNING"
+SEALING = "SEALING"
+OPENING = "OPENING"
+
+SYSTEM_STATE = STAY
+TARGET_ACTION = None  # 'S' or 'O'
+
+state_lock = threading.Lock()
+serial_lock = threading.Lock()
+
+# 클라이언트 및 프레임 공유
+clients = []
+latest_annotated_frame = None
+latest_detections_json = "{}"
+frame_lock = threading.Lock()
+detections_lock = threading.Lock()
+
+# =========================
+# 하드웨어 보조 함수
+# =========================
 def ensure_serial_open():
     global ser
     if ser is None or not ser.is_open:
@@ -47,17 +75,26 @@ def ensure_serial_open():
             return False
     return True
 
-# 카메라 오픈
 def ensure_camera_open():
     global cap
     if cap is not None and cap.isOpened():
         return True
+    
     try:
-        device = "/dev/video0"  # 필요시 바꾸세요
-        cap = cv2.VideoCapture(device, cv2.CAP_V4L2)  # V4L2 명시
+        device = "/dev/video0"
+        cap = cv2.VideoCapture(device, cv2.CAP_V4L2)
+        
+        # ✅ 추가 최적화 설정
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        cap.set(cv2.CAP_PROP_FPS, 20)  # ✅ 30에서 20으로
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))  # ✅ MJPEG 코덱 사용
+        
         if cap.isOpened():
+            # ✅ 초기 프레임 몇 개 버리기 (카메라 안정화)
+            for _ in range(5):
+                cap.read()
             print(f"[CAM] open OK {device}")
             return True
         else:
@@ -69,147 +106,118 @@ def ensure_camera_open():
         cap = None
         return False
 
-# 카메라 설정
-try:
-    # [변경점] 카메라 인덱스(8) 대신, 터미널에서 확인한 장치 경로를 직접 입력합니다.
-    # 예시로 /dev/video0 을 사용했으며, 실제 확인된 경로로 수정해주세요.
-    CAMERA_DEVICE_PATH = "/dev/video0" 
-    cap = cv2.VideoCapture(CAMERA_DEVICE_PATH)
-    
-    if not cap.isOpened():
-        raise IOError(f"Cannot open webcam: {CAMERA_DEVICE_PATH}")
-        
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-    print(f"카메라 초기화 성공: {CAMERA_DEVICE_PATH}")
+# =========================
+# 감지 루프(스레드)
+# =========================
 
-except Exception as e:
-    print(f"카메라 초기화 실패: {e}")
-    cap = None
-
-# 시리얼 통신 설정
-SERIAL_PORT = '/dev/ttyUSB0' 
-BAUD_RATE = 9600 # 아두이노 스케치에서 설정한 보드레이트와 동일하게 맞춰야 합니다.
-ser = None # 시리얼 객체 초기화
-
-# --- [추가] 상태 머신을 위한 전역 변수 ---
-STAY = "STAY"
-ALIGNING = "ALIGNING"
-SEALING = "SEALING"
-OPENING = "OPENING"
-
-SYSTEM_STATE = STAY
-TARGET_ACTION = None # 정렬 후 수행할 작업 ('S' 또는 'O')
-
-state_lock = threading.Lock()
-serial_lock = threading.Lock()
-# --- [추가] 끝 ---
-
-
-# 클라이언트 및 데이터 공유를 위한 변수
-clients = []
-latest_annotated_frame = None
-latest_detections_json = "{}"
-frame_lock = threading.Lock()
-detections_lock = threading.Lock()
-
-# --- 객체 감지 및 데이터 처리 (백그라운드 스레드 - 생산자) ---
 def detection_loop():
-    global latest_annotated_frame, latest_detections_json, cap, ser, SYSTEM_STATE, TARGET_ACTION, PROCESS_START_TIME
-
+    global latest_annotated_frame, latest_detections_json, cap, ser, SYSTEM_STATE, TARGET_ACTION
+    global YOLO_ON
+    
+    last_serial_send_time = 0
+    last_alignment_check = 0  # ✅ 정렬 체크 타이밍 추가
+    frame_skip_counter = 0
+    TARGET_FPS = 20  # ✅ 30에서 20으로 감소 (부하 감소)
+    frame_interval = 1.0 / TARGET_FPS
+    
     while True:
-        # 카메라가 닫혀 있으면 재시도
+        loop_start_time = time.time()
+        
         if not ensure_camera_open():
             time.sleep(1.0)
             continue
 
+        # ✅ 버퍼 비우기 (최신 프레임만 가져오기)
+        for _ in range(2):  # 버퍼에 있는 오래된 프레임 제거
+            cap.grab()
+        
         ret, frame = cap.read()
         if not ret:
             print("[CAM] read fail, will retry...")
-            time.sleep(0.2)
+            time.sleep(0.1)
             continue
         
-         # --- [수정] 비디오 스트리밍 멈춤 없는 상태 관리 ---
         with state_lock:
             current_state = SYSTEM_STATE
             yolo_active = YOLO_ON
-            # 밀봉 또는 개봉 작업이 진행 중일 때, 시간이 다 되었는지 확인
-            if current_state in [SEALING, OPENING] and PROCESS_START_TIME is not None:
-                if time.time() - PROCESS_START_TIME > PROCESS_DURATION:
-                    print(f"✅ time({PROCESS_DURATION}second) 경과. 시스템 상태를 '{STAY}'로 복귀합니다.")
-                    SYSTEM_STATE = STAY
-                    TARGET_ACTION = None
-                    PROCESS_START_TIME = None
-                    YOLO_ON = False
-                    yolo_active = False
-        # --- [수정] 끝 ---
-
-        # --- 카메라 중심 좌표 계산 및 표시 ---
+            target_action = TARGET_ACTION
+        
+        # 카메라 중심 표시 코드는 그대로...
         h, w, _ = frame.shape
         cam_center_x, cam_center_y = w // 2, h // 2
-
-        # 카메라 중심점에 파란색 원과 (0, 0) 텍스트 표시
+        cv2.line(frame, (0, cam_center_y), (w, cam_center_y), (0, 255, 255), 1)
         cv2.circle(frame, (cam_center_x, cam_center_y), 5, (255, 0, 0), -1)
-        cv2.putText(frame, "(0, 0)", (cam_center_x + 10, cam_center_y + 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
-        # --- 끝 ---
+        cv2.putText(frame, f"(X:{cam_center_x}, Y:{cam_center_y})", (cam_center_x + 10, cam_center_y + 10),cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
         
         detections = []
         results = None
-        # 2. 결과 처리 및 화면 그리기
-        # --- 상태가 ALIGNING일 때만 위치 보정 신호를 보냄 
-
-        # ✅ YOLO가 켜진 경우에만 추론/정렬 수행
-        if yolo_active:
-            results = model(frame, classes=0, conf=0.8, verbose=False)[0]
-            if current_state == ALIGNING:
-                serial_data_to_send = '2' # 기본값: 동일 (2)
-            
-                if results.boxes:
-                    first_box = results.boxes[0]
-                    x1, y1, x2, y2 = map(int, first_box.xyxy[0])
-                    # --- 객체 중심의 상대 좌표 계산 ---
-                    obj_center_x = (x1 + x2) // 2
-                    # 카메라 중심을 (0,0)으로 하는 상대 좌표
-                    relative_x = obj_center_x - cam_center_x
-
-                    # --- 시리얼 통신을 위한 데이터 결정 (데드존 적용) ---
-                    deadzone_pixels = 10  # 좌우 10픽셀을 데드존으로 설정
-                    conf_val = float(first_box.conf[0])
-                    
-                    if relative_x < -deadzone_pixels:
-                        serial_data_to_send = 'left' # 와인이 중심보다 왼쪽에 있음
-                        print('left')
-                    elif relative_x > deadzone_pixels:
-                        serial_data_to_send = 'right' # 와인이 중심보다 오른쪽에 있음
-                        print('right')
-                    else:
-                        serial_data_to_send = 'center' # 와인이 중앙 데드존 안에 위치함 (정렬 완료)
-                        # 정렬 완료 시, 목표했던 작업(밀봉/개봉) 신호 전송
-                        if TARGET_ACTION:
-                            print(f"정렬 완료! 목표 작업 '{TARGET_ACTION}' 신호를 전송합니다.")
-                            send_serial_command(TARGET_ACTION)
-                            set_yolo_active(False)
-                            
-                            # 상태 변경
-                            if TARGET_ACTION == 'S':
-                                SYSTEM_STATE = SEALING
-                            elif TARGET_ACTION == 'O':
-                                SYSTEM_STATE = OPENING
-                            
-                            PROCESS_START_TIME = time.time() # 작업 시작 시간 기록
-                            TARGET_ACTION = None # 목표 작업 초기화
-                    
-                else: # 감지된 객체가 없을 경우(예외처리)
-                    print('no merc')
-                    serial_data_to_send = 'nowine' # 예를 들어, 와인이 감지되지 않았음을 알리는 코드 (선택 사항)
-            
-            # 3. 정렬 신호 전송 값이 있을 때만 송신
-                if serial_data_to_send is not None:
-                    send_serial_command(serial_data_to_send, show_log=True)
         
-            # 웹소켓 및 영상 스트리밍을 위한 화면 그리기는 상태와 상관없이 항상 수행
-            if results.boxes:
+        if yolo_active:
+            frame_skip_counter += 1
+            should_run_yolo = (frame_skip_counter % 3 == 0)  # ✅ 3프레임당 1번으로 변경
+            
+            if should_run_yolo:
+                # ✅ YOLO 추론 최적화
+                results = model(frame, 
+                              classes=0, 
+                              conf=0.7, 
+                              verbose=False,
+                              imgsz=320,  # 고정 크기 -> 잘 안되면 416으로 변경하기.
+                              device='cpu',  # CPU 명시
+                              max_det=1)[0]  # 최대 1개 객체만 검출
+            
+            now = time.time()
+            if current_state == ALIGNING and results is not None:
+                # 제어 신호 전송 최적화
+                if now - last_serial_send_time >= 0.3:  # 일정한 간격
+                    if results.boxes and len(results.boxes) > 0:
+                        first_box = results.boxes[0]
+                        x1, y1, x2, y2 = map(int, first_box.xyxy[0])
+                        obj_center_y = (y1 + y2) // 2
+                        relative_x = obj_center_y - cam_center_y
+                        
+                        print(f"[ALIGN] Camera center: {cam_center_y}, Wine center: {obj_center_y}, Relative: {relative_x}")
+                        
+                        deadzone_pixels = 5
+                        
+                        if abs(relative_x) <= deadzone_pixels:
+                            # 정렬 완료 확인 로직 개선
+                            if last_alignment_check == 0:
+                                last_alignment_check = now  # 0.5초 동안 정렬 유지 확인
+                                
+                            elif now - last_alignment_check >= 0.5:
+                                send_serial_command('C\n', show_log=True)
+                                print("[ALIGN] Alignment confirmed! Sending target action...")
+                                
+                                time.sleep(0.2)  # 0.1에서 0.2로 증가
+                                if target_action:
+                                    send_serial_command(target_action, show_log=True)
+                                    with state_lock:
+                                        SYSTEM_STATE = SEALING if target_action == 'S\n' else OPENING
+                                else:
+                                    print("[ERROR] No target action set!")
+                                    with state_lock:
+                                        SYSTEM_STATE = STAY
+                                
+                                set_yolo_active(False)
+                                last_alignment_check = 0
+                        else:
+                            last_alignment_check = 0  # 정렬 벗어나면 리셋
+                            
+                            if relative_x < -deadzone_pixels:
+                                send_serial_command('R\n', show_log=True)
+                            else:
+                                send_serial_command('L\n', show_log=True)
+                        
+                        last_serial_send_time = now
+                    else:
+                        print("[ALIGN] No wine bottle detected")
+                        # ✅ 와인병 미감지 시 정지 신호
+                        if now - last_serial_send_time >= 1.0:  # 1초마다
+                            last_serial_send_time = now
+
+            # 화면 그리기 코드는 그대로...
+            if results and results.boxes and len(results.boxes) > 0:
                 first_box = results.boxes[0]
                 x1, y1, x2, y2 = map(int, first_box.xyxy[0])
                 conf = float(first_box.conf[0])
@@ -225,61 +233,94 @@ def detection_loop():
                     "conf": conf, "class_id": class_id, "class_name": class_name,
                     "relative_center": {"x": relative_x, "y": relative_y}
                 })
+                
+                # 박스 및 텍스트 그리기
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
                 label_text = f"{class_name} {conf:.2f}"
-                cv2.putText(frame, label_text, (x1, y1 - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                cv2.putText(frame, label_text, (x1, y1 - 30), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
                 coord_text = f"({relative_x}, {relative_y})"
-                cv2.putText(frame, coord_text, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                cv2.putText(frame, coord_text, (x1, y1 - 10), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                
         else:
-            # 선택: YOLO OFF 워터마크
             cv2.putText(frame, "YOLO: OFF", (10, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
-        # 4. 처리된 결과물을 스레드 안전하게 전역 변수에 저장
+        # 상태 표시
+        status_text = f"State: {current_state}"
+        if target_action:
+            # 1. 어떤 작업인지(SEAL 또는 OPEN)를 먼저 결정해서 변수에 담습니다.
+            target_display = "SEAL" if target_action == 'S\n' else "OPEN"
+            # 2. 그 변수를 f-string 안에서 사용합니다.
+            status_text += f" | Target: {target_display}"
+
+        cv2.putText(frame, status_text, (10, h - 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+        # 결과 저장 (기존 코드와 동일)
         with detections_lock:
-            latest_detections_json = json.dumps({"timestamp": time.time(), "detections": detections})
+            latest_detections_json = json.dumps({
+                "timestamp": time.time(), 
+                "detections": detections,
+                "state": current_state,
+                "target": target_action  # ✅ 타겟 액션 추가
+            })
 
         with frame_lock:
-            _, buffer = cv2.imencode('.jpg', frame)
+            _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])  # ✅ 85에서 80으로
             latest_annotated_frame = buffer.tobytes()
 
-        time.sleep(0.03) # CPU 사용량 조절
+        # FPS 제어
+        elapsed = time.time() - loop_start_time
+        sleep_time = max(0, frame_interval - elapsed)
+        if sleep_time > 0:
+            time.sleep(sleep_time)
 
-    cap.release()
-
-# --- 웹소켓 데이터 브로드캐스팅 (소비자) ---
+# =========================
+# WS 브로드캐스터
+# =========================
 async def broadcast_detections():
     while True:
-        data = None
         with detections_lock:
             data = latest_detections_json
         dead = []
-        for ws in list(clients):   # 스냅샷 반복
+        for ws in list(clients):
             try:
                 await ws.send_text(data)
             except Exception:
                 dead.append(ws)
         for ws in dead:
-            try: clients.remove(ws)
-            except: pass
-
+            try:
+                clients.remove(ws)
+            except:
+                pass
         await asyncio.sleep(0.1)
 
-# --- FastAPI Lifespan 및 라우트 설정 ---
+# =========================
+# FastAPI 앱/라이프사이클
+# =========================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # ▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼
+    # YOLO Warm-up 코드 추가
+    print("YOLO model warming up...")
+    # 더미(dummy) 이미지 생성 (실제 이미지와 크기, 채널을 맞추는 것이 좋음)
+    dummy_image = np.zeros((480, 640, 3), dtype=np.uint8) 
+    # 모델을 한 번 실행하여 미리 준비시킴
+    model(dummy_image, verbose=False) 
+    print("YOLO model is ready.")
+    # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
+
     print("서버 시작: 감지 스레드 및 브로드캐스터 시작...")
     detection_thread = threading.Thread(target=detection_loop, daemon=True)
     detection_thread.start()
-    
-    # 버튼 수신 스레드 시작
+
     serial_thread = threading.Thread(target=serial_reader_loop, daemon=True)
     serial_thread.start()
 
-    # WS 브로드캐스트 태스크 시작
     broadcast_task = asyncio.create_task(broadcast_detections())
     broadcast_btn_task = asyncio.create_task(broadcast_buttons())
-
     try:
         yield
     finally:
@@ -290,119 +331,111 @@ async def lifespan(app: FastAPI):
             cap.release()
 
 app = FastAPI(lifespan=lifespan)
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
     allow_methods=["*"], allow_headers=["*"],
 )
 
-## ----------- 아두이노 제어 API (상태 머신 적용) ---------------- ##
-
+# =========================
+# 시리얼 전송/컨트롤 API
+# =========================
 def send_serial_command(command: str, show_log: bool = True):
-    print('send function success')
     if not ensure_serial_open():
-        if show_log: print("not open")
+        if show_log: print("Serial port not open")
         return False, "Serial port not open"
     try:
         with serial_lock:
             ser.write(command.encode('utf-8'))
-        if show_log: print(f"Serial command sent: '{command}'")
-        return True, f"Command '{command}' sent"
+            ser.flush()
+        if show_log: print(f"Serial command sent: '{command.strip()}'")
+        return True, f"Command '{command.strip()}' sent"
     except Exception as e:
-        if show_log: print(f"serial command send fail: {e}")
+        if show_log: print(f"Serial command send fail: {e}")
         return False, str(e)
 
 @app.post("/control/seal", tags=["Arduino Control"])
 async def start_sealing():
     """밀봉을 위한 정렬 프로세스를 시작합니다."""
-    global SYSTEM_STATE, TARGET_ACTION, PROCESS_START_TIME
-    set_yolo_active(True)
+    global SYSTEM_STATE, TARGET_ACTION
     with state_lock:
         if SYSTEM_STATE != STAY:
             return JSONResponse(status_code=409, content={"status": "error", "message": f"System is busy with '{SYSTEM_STATE}'"})
         SYSTEM_STATE = ALIGNING
-        TARGET_ACTION = 'S'
-        PROCESS_START_TIME = None
-        print(f"SystemState Change: {STAY} -> {ALIGNING} (목표: 밀봉)")
+        TARGET_ACTION = 'S\n'
+    print(f"SystemState Change: {STAY} -> {ALIGNING} (목표: 밀봉)")
     return {"status": "ok", "message": "Alignment process for sealing has been started."}
 
 @app.post("/control/open", tags=["Arduino Control"])
 async def start_opening():
     """개봉을 위한 정렬 프로세스를 시작합니다."""
-    global SYSTEM_STATE, TARGET_ACTION, PROCESS_START_TIME
-    set_yolo_active(True)
+    global SYSTEM_STATE, TARGET_ACTION
     with state_lock:
         if SYSTEM_STATE != STAY:
             return JSONResponse(status_code=409, content={"status": "error", "message": f"System is busy with '{SYSTEM_STATE}'"})
         SYSTEM_STATE = ALIGNING
-        TARGET_ACTION = 'O'
-        PROCESS_START_TIME = None
-        print(f"시스템 상태 변경: {STAY} -> {ALIGNING} (목표: 개봉)")
+        TARGET_ACTION = 'O\n'
+    print(f"SystemState Change: {STAY} -> {ALIGNING} (목표: 개봉)")
     return {"status": "ok", "message": "Alignment process for opening has been started."}
 
 @app.post("/control/home", tags=["Arduino Control"])
 async def return_to_home():
-    """초기 위치 복귀 ('H') 신호를 아두이노에 전송합니다."""
-    success, message = send_serial_command('H')
+    success, message = send_serial_command('H\n')
     if success:
         return {"status": "ok", "message": message}
     return JSONResponse(status_code=500, content={"status": "error", "message": message})
-    
+
 @app.post("/control/stop", tags=["Arduino Control"])
 async def emergency_stop():
-    """긴급 정지 ('E') 신호를 아두이노에 전송하고 시스템 상태를 초기화합니다."""
-    global SYSTEM_STATE, TARGET_ACTION, PROCESS_START_TIME
+    global SYSTEM_STATE, TARGET_ACTION
     with state_lock:
         SYSTEM_STATE = STAY
         TARGET_ACTION = None
-        PROCESS_START_TIME = None
     set_yolo_active(False)
-    success, message = send_serial_command('E')
+    success, message = send_serial_command('E\n')
     if success:
         return {"status": "ok", "message": f"{message}. System state has been reset to '{STAY}'."}
     return JSONResponse(status_code=500, content={"status": "error", "message": message})
 
+# =========================
+# WebSocket
+# =========================
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    clients.append(websocket)  # (선택) 버튼 브로드캐스트 용도
+    clients.append(websocket)
     print(f"[PID {os.getpid()}] WS connect. clients={len(clients)}")
-
-    # 연결 알림 한 번 전송
     await websocket.send_text(json.dumps({"type": "connected", "ts": time.time()}))
 
     async def sender():
-        # 주기적으로 감지 JSON을 이 커넥션에 직접 전송
         while True:
             with detections_lock:
                 data = latest_detections_json
             await websocket.send_text(data)
-            await asyncio.sleep(0.1)  # 10fps
+            await asyncio.sleep(0.1)
 
     async def receiver():
-        # 클라에서 오는 메시지 처리 (ping 등)
         while True:
             msg = await websocket.receive_text()
             t = (msg or "").strip()
             if t == "ping" or t == '{"type":"ping"}':
                 await websocket.send_text(json.dumps({"type":"pong","ts":time.time()}))
                 continue
-            # 필요한 메시지 프로토콜 추가 처리 가능
 
     try:
         await asyncio.gather(sender(), receiver())
     except WebSocketDisconnect:
         pass
     finally:
-        # 정리
         try:
             clients.remove(websocket)
         except Exception:
             pass
         print(f"[PID {os.getpid()}] WS disconnect. clients={len(clients)}")
 
-# MJPEG 영상 스트리밍 (소비자)
+# =========================
+# MJPEG 스트림
+# =========================
 def generate_annotated_frame():
     while True:
         with frame_lock:
@@ -410,7 +443,6 @@ def generate_annotated_frame():
                 time.sleep(0.03)
                 continue
             frame_bytes = latest_annotated_frame
-        
         yield (b"--frame\r\n"
                b"Content-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n")
         time.sleep(0.02)
@@ -419,7 +451,9 @@ def generate_annotated_frame():
 def video_feed():
     return StreamingResponse(generate_annotated_frame(), media_type="multipart/x-mixed-replace; boundary=frame")
 
-# React 정적 파일 서빙
+# =========================
+# 정적 파일(React)
+# =========================
 FRONTEND_DIR = os.path.join(os.path.dirname(__file__), "..", "frontend", "dist")
 if os.path.exists(FRONTEND_DIR):
     app.mount("/static", StaticFiles(directory=os.path.join(FRONTEND_DIR, "assets")), name="static")
@@ -434,12 +468,11 @@ else:
     def root():
         return {"message": "Backend is running, but frontend build is not found."}
 
-# --- [추가] 버튼 시리얼 수신 전용 스레드 ---
+# =========================
+# 시리얼 수신(스레드)
+# =========================
 def serial_reader_loop():
-    global ser, last_button
-    BTN_DEBOUNCE_MS = 150
-    last_ts = 0.0
-
+    global ser, SYSTEM_STATE, TARGET_ACTION
     while True:
         if not ensure_serial_open():
             time.sleep(0.5)
@@ -447,44 +480,68 @@ def serial_reader_loop():
         try:
             with serial_lock:
                 raw = ser.readline()
-            if not raw:
-                continue
+                if not raw:
+                    continue
+            
             line = raw.decode(errors="ignore").strip()
+            print(f"[SERIAL READ] Raw data: '{line}'")
 
-            # "BTN:1" 같은 포맷도 허용
-            if line.startswith("BTN:"):
-                line = line.split(":",1)[1].strip()
+            # 아두이노 명령 처리
+            if line == 'A':
+                print("[SERIAL READ] 'A' - Arduino requesting alignment")
+                set_yolo_active(True)
+                with state_lock:
+                    SYSTEM_STATE = ALIGNING
+                    # TARGET_ACTION은 이미 버튼으로 설정되어 있어야 함
+                    
+            elif line == 'F':
+                print("[SERIAL READ] 'F' - Process finished")
+                set_yolo_active(False)
+                with state_lock:
+                    SYSTEM_STATE = STAY
+                    TARGET_ACTION = None
+            
+            # 버튼 이벤트 처리
+            elif line == '1':
+                print("[SERIAL READ] Button 1 - Seal process")
+                with state_lock:
+                    TARGET_ACTION = 'S\n'  # ✅ TARGET_ACTION 설정 추가
+                button_queue.put_nowait("SEAL_REDIRECT")
+                
+            elif line == '2':
+                print("[SERIAL READ] Button 2 - Open process")
+                with state_lock:
+                    TARGET_ACTION = 'O\n'  # ✅ TARGET_ACTION 설정 추가
+                button_queue.put_nowait("OPEN_REDIRECT")
 
-            if line in ("1","2","3"):
-                now = time.time()
-                if (now - last_ts) * 1000 >= BTN_DEBOUNCE_MS:  # 디바운스
-                    last_button = int(line)
-
-                    # ✅ 버튼 1/2에서 YOLO 추론 ON
-                    if last_button in (1, 2):
-                        set_yolo_active(True)
-
-                    button_queue.put_nowait(last_button)  # 그대로 사용해도 OK
-                    last_ts = now
         except Exception as e:
             print(f"시리얼 읽기 오류: {e}")
             try:
                 with serial_lock:
-                    ser.close()
+                    if ser:
+                        ser.close()
             except:
                 pass
             ser = None
             time.sleep(1)
 
-
-# --- [추가] 버튼 이벤트 브로드캐스트 (큐를 async에서 소비) ---
+# =========================
+# 버튼 이벤트 WS 브로드캐스트
+# =========================
 async def broadcast_buttons():
     loop = asyncio.get_running_loop()
     while True:
-        # blocking Queue.get()를 안전하게 실행
-        btn = await loop.run_in_executor(None, button_queue.get)
-        payload = json.dumps({"type": "button", "value": btn, "ts": time.time()})
-        print(f"[WS] broadcasting button={btn} to {len(clients)} clients")
+        event = await loop.run_in_executor(None, button_queue.get)
+        if event == "SEAL_REDIRECT":
+            payload = json.dumps({"type": "redirect", "page": "/seal"})
+            print(f"[WS] redirect /seal → {len(clients)} clients")
+        elif event == "OPEN_REDIRECT":
+            payload = json.dumps({"type": "redirect", "page": "/open"})
+            print(f"[WS] redirect /open → {len(clients)} clients")
+        else:
+            payload = json.dumps({"type": "button", "value": event, "ts": time.time()})
+            print(f"[WS] broadcasting button={event} → {len(clients)} clients")
+
         dead = []
         for ws in list(clients):
             try:
@@ -492,10 +549,14 @@ async def broadcast_buttons():
             except Exception:
                 dead.append(ws)
         for ws in dead:
-            try: clients.remove(ws)
-            except: pass
+            try:
+                clients.remove(ws)
+            except:
+                pass
 
+# =========================
+# 엔트리포인트
+# =========================
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
