@@ -22,7 +22,7 @@ model.fuse()
 
 # 카메라/시리얼 전역 핸들
 cap = None
-SERIAL_PORT = '/dev/ttyACM0'
+SERIAL_PORT = '/dev/arduino'
 BAUD_RATE = 9600
 ser = None
 
@@ -83,7 +83,7 @@ def ensure_camera_open():
         return True
     
     try:
-        device = "/dev/video1"
+        device = "/dev/winecam"
         cap = cv2.VideoCapture(device, cv2.CAP_V4L2)
         
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
@@ -172,7 +172,7 @@ def detection_loop():
                               classes=0, 
                               conf=0.5, 
                               verbose=False,
-                              imgsz=192,
+                              imgsz=128,
                               device='cpu',
                               max_det=1)[0]
             
@@ -187,7 +187,7 @@ def detection_loop():
                         
                         print(f"[ALIGN] Camera center: {cam_center_y}, Wine center: {obj_center_y}, Relative: {relative_x}")
                         
-                        deadzone_pixels = 70
+                        deadzone_pixels = 3
                         
                         if abs(relative_x) <= deadzone_pixels:
                             if last_alignment_check == 0:
@@ -497,6 +497,7 @@ def serial_reader_loop():
                 with state_lock:
                     SYSTEM_STATE = STAY
                     TARGET_ACTION = None
+                button_queue.put_nowait("PROCESS_FINISHED") 
             
             elif line in '1':
                 print("[SERIAL READ] Button 1 - Seal process")
@@ -534,6 +535,9 @@ async def broadcast_buttons():
         elif event == "OPEN_REDIRECT":
             payload = json.dumps({"type": "redirect", "page": "/open"})
             print(f"[WS] redirect /open → {len(clients)} clients")
+        elif event == "PROCESS_FINISHED":                                                                      
+            payload = json.dumps({"type": "process_status", "status": "finished", "ts": time.time()})          
+            print(f"[WS] broadcasting process status=finished → {len(clients)} clients")  
         else:
             payload = json.dumps({"type": "button", "value": event, "ts": time.time()})
             print(f"[WS] broadcasting button={event} → {len(clients)} clients")
